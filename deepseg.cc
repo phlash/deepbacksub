@@ -24,6 +24,7 @@ limitations under the License.
 #include "inference.h"
 #include "dlibhog.h"
 
+
 #define TFLITE_MINIMAL_CHECK(x)                              \
   if (!(x)) {                                                \
 	fprintf(stderr, "Error at %s:%d\n", __FILE__, __LINE__); \
@@ -121,9 +122,9 @@ bool process_frame(cv::Mat *cap, void *ctx) {
 
 int main(int argc, char* argv[]) {
 
-	printf("deepseg v0.2.0\n");
-	printf("(c) 2020 by floe@butterbrot.org - https://github.com/floe/deepseg\n");
-	printf("(c) 2020 by phil.github@ashbysoft.com - https://github.com/phlash/deepseg\n");
+	printf("deepseg v0.2.1\n");
+	printf("(c) 2021 by floe@butterbrot.org - https://github.com/floe/deepseg\n");
+	printf("(c) 2021 by phil.github@ashbysoft.com - https://github.com/phlash/deepseg\n");
 
 	signal(SIGSEGV, trap);
 	signal(SIGABRT, trap);
@@ -131,17 +132,18 @@ int main(int argc, char* argv[]) {
 	int threads= 2;
 	int width  = 640;
 	int height = 480;
-	const char *back = "background.png";
+	const char *back = "images/background.png";
 	const char *vcam = "/dev/video0";
 	const char *ccam = "/dev/video1";
 
 	bool usehog = false;
-	const char* modelname = "deeplabv3_257_mv_gpu.tflite";
+	const char* modelname = "models/segm_full_v679.tflite";
 
 	for (int arg=1; arg<argc; arg++) {
 		if (strncmp(argv[arg], "-?", 2)==0) {
-			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>]\n"
-							"[-t <tensorflow threads:2>] -m <tf model file>] [-b <background.png>] [-g (use dlib hoG, not tensorflow)]\n");
+			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:%s>] [-v <vcam:%s>] [-w <width:%d>] [-h <height:%d>] "
+							"[-t <threads:%d>] [-b <%s>] [-m <%s>] [-g (use hoG):%s]\n",
+							ccam,vcam,width,height,threads,back,modelname,usehog?"true":"false");
 			exit(0);
 		} else if (strncmp(argv[arg], "-d", 2)==0) {
 			++debug;
@@ -210,6 +212,7 @@ int main(int argc, char* argv[]) {
 	tfinfo_t *ptf = NULL;
 	cv::Mat input;
 	cv::Mat output;
+	float ratio = 1.0f;
 	if (usehog) {
 		// Load HOG
 		phg = hog_init(debug);
@@ -224,14 +227,15 @@ int main(int argc, char* argv[]) {
 		tbuf = tf_get_buffer(ptf, TFINFO_BUF_OUT);
 		output = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
 		delete tbuf;
-		TFLITE_MINIMAL_CHECK( input.rows ==  input.cols);
-		TFLITE_MINIMAL_CHECK(output.rows == output.cols);
+		ratio = (float)input.rows/(float) input.cols;
+		printf("model rows=%d, cols=%d ratio=%f\n", input.rows, input.cols, ratio);
 	}
 
 	// initialize mask and square ROI in center
-	cv::Rect roidim = cv::Rect((width-height)/2,0,height,height);
+	cv::Rect roidim = cv::Rect((width-height/ratio)/2,0,height/ratio,height);
 	cv::Mat mask = cv::Mat::zeros(height,width,CV_32FC1);
 	cv::Mat mroi = mask(roidim);
+	printf("roidim(x,y,w,h)=(%d,%d,%d,%d)\n",roidim.x,roidim.y,roidim.width,roidim.height);
 	mask.copyTo(fctx.mask);
 
 	// erosion/dilation elements
@@ -239,6 +243,7 @@ int main(int argc, char* argv[]) {
 	cv::Mat element7 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(7,7) );
 	cv::Mat element11 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(11,11) );
 
+	// label number of "person" for DeepLab v3+ model
 	const int cnum = labels.size();
 	const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
 
@@ -249,7 +254,15 @@ int main(int argc, char* argv[]) {
 	int64 es = cv::getTickCount();
 	int64 e1 = es;
 	int64 fr = 0;
+	int64 lcap = 0;
 	while (!fctx.done) {
+
+		// wait for next capture frame (we might be quicker than input rate now!)
+		while (lcap==capture_count(fctx.pcap)) {
+			struct timespec ts = { 0, 1000000 }; // 1ms
+			clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+		}
+		lcap = capture_count(fctx.pcap);
 
 		// grab last captured frame
 		cv::Mat cap;
@@ -275,6 +288,7 @@ int main(int argc, char* argv[]) {
 			cv::cvtColor(roi,in_u8_rgb,CV_BGR2RGB);
 			// TODO: can convert directly to float?
 			cv::resize(in_u8_rgb,in_resized,cv::Size(input.cols,input.rows));
+			if (debug > 2) cv::imshow("input",in_resized);
 
 			// convert to float and normalize values to [-1;1]
 			in_resized.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
@@ -304,7 +318,23 @@ int main(int argc, char* argv[]) {
 				for (unsigned int n = 0; n < output.total(); n++) {
 					if (tmp[n] < 0.65) out[n] = 0; else out[n] = 1.0;
 				}
+			} else if (strstr(modelname,"segm_")) {
+				// Google Meet segmentation network
+					/* 256 x 144 x 2 tensor for the full model or 160 x 96 x 2
+					 * tensor for the light model with masks for background
+					 * (channel 0) and person (channel 1) where values are in
+					 * range [MIN_FLOAT, MAX_FLOAT] and user has to apply
+					 * softmax across both channels to yield foreground
+					 * probability in [0.0, 1.0]. */
+				for (unsigned int n = 0; n < output.total(); n++) {
+					float exp0 = expf(tmp[2*n  ]);
+					float exp1 = expf(tmp[2*n+1]);
+					float p0 = exp0 / (exp0+exp1);
+					float p1 = exp1 / (exp0+exp1);
+					if (p0 < p1) out[n] = 1.0; else out[n] = 0;
+				}
 			}
+			if (debug > 2) cv::imshow("ofinal",ofinal);
 
 			// denoise, close & open with small then large elements, adapted from:
 			// https://stackoverflow.com/questions/42065405/remove-noise-from-threshold-image-opencv-python
@@ -320,6 +350,7 @@ int main(int argc, char* argv[]) {
 				cv::blur(ofinal,ofinal,cv::Size(7,7));
 			// scale up into full-sized mask
 			cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
+
 		}
 		// update mask for render thread (under lock)
 		pthread_mutex_lock(&fctx.lock);

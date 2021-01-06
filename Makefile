@@ -1,12 +1,11 @@
-
 CFLAGS = -Ofast -march=native -fno-trapping-math -fassociative-math -funsafe-math-optimizations -Wall -pthread
 LDFLAGS = -lrt -ldl
 
 # TensorFlow
-TFBASE=../tensorflow.git
-TFLITE=$(TFBASE)/tensorflow/lite/tools/make/
+TFBASE=tensorflow/
+TFLITE=$(TFBASE)tensorflow/lite/tools/make/
 CFLAGS += -I $(TFBASE) -I $(TFLITE)/downloads/absl -I $(TFLITE)/downloads/flatbuffers/include
-LDFLAGS += -L $(TFLITE)/gen/linux_x86_64/lib/ -ltensorflow-lite
+LDFLAGS += -L $(TFLITE)/gen/linux_x86_64/lib/ -ltensorflow-lite -ldl
 
 # DLib - lord knows why we have to specify full paths to libblas & liblapack..
 # if we try -lblas -llapack, it b0rks with unknown symbols or libraries
@@ -25,11 +24,17 @@ else ifeq ($(shell pkg-config --exists opencv4; echo $$?), 0)
     CFLAGS += $(shell pkg-config --cflags opencv4)
     LDFLAGS += $(shell pkg-config --libs opencv4)
 else
-    $(error Couldn't find OpenCV)
+    $(error Couldn\'t find OpenCV)
 endif
 
-deepseg: deepseg.cc loopback.cc capture.cc inference.cc dlibhog.cc
+deepseg: deepseg.cc loopback.cc capture.cc inference.cc transpose_conv_bias.cc dlibhog.cc
 	g++ $^ ${CFLAGS} ${LDFLAGS} -o $@
+
+$(TFLIBS)/libtensorflow-lite.a: $(TFLITE)
+	cd $(TFLITE) && ./download_dependencies.sh && ./build_lib.sh
+
+$(TFLITE):
+	git submodule update --init --recursive
 
 all: deepseg
 

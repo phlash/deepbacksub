@@ -5,6 +5,7 @@
 #include <tensorflow/lite/kernels/register.h>
 
 #include "inference.h"
+#include "transpose_conv_bias.h"
 
 using namespace tflite;
 
@@ -27,6 +28,8 @@ tfinfo_t *tf_init(const char *modelname, int threads, int debug) {
 
 	// Build the interpreter
 	tflite::ops::builtin::BuiltinOpResolver resolver;
+	// custom op for Google Meet network
+	resolver.AddCustom("Convolution2DTransposeBias", mediapipe::tflite_operations::RegisterConvolution2DTransposeBias());
 	InterpreterBuilder builder(*(ptf->model), resolver);
 	builder(&ptf->interpreter);
 	ASSERT_OR_NULL(ptf->interpreter != nullptr);
