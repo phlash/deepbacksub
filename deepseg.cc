@@ -132,48 +132,111 @@ int main(int argc, char* argv[]) {
 	int threads= 2;
 	int width  = 640;
 	int height = 480;
-	const char *back = "images/background.png";
+	const char *back = nullptr; // "images/background.png";
 	const char *vcam = "/dev/video0";
 	const char *ccam = "/dev/video1";
+	bool flipHorizontal = false;
+	bool flipVertical   = false;
 
 	bool usehog = false;
 	const char* modelname = "models/segm_full_v679.tflite";
 
+	bool showUsage = false;
 	for (int arg=1; arg<argc; arg++) {
+		bool hasArgument = arg+1 < argc;
 		if (strncmp(argv[arg], "-?", 2)==0) {
-			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:%s>] [-v <vcam:%s>] [-w <width:%d>] [-h <height:%d>] "
-							"[-t <threads:%d>] [-b <%s>] [-m <%s>] [-g (use hoG):%s]\n",
-							ccam,vcam,width,height,threads,back,modelname,usehog?"true":"false");
-			exit(0);
+			showUsage = true;
 		} else if (strncmp(argv[arg], "-d", 2)==0) {
 			++debug;
+		} else if (strncmp(argv[arg], "-H", 2)==0) {
+			flipHorizontal = true;
+		} else if (strncmp(argv[arg], "-V", 2)==0) {
+			flipVertical = true;
 		} else if (strncmp(argv[arg], "-g", 2)==0) {
 			usehog = true;
 		} else if (strncmp(argv[arg], "-v", 2)==0) {
-			vcam = argv[++arg];
+			if (hasArgument) {
+				vcam = argv[++arg];
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-c", 2)==0) {
-			ccam = argv[++arg];
+			if (hasArgument) {
+				ccam = argv[++arg];
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-b", 2)==0) {
-			back = argv[++arg];
+			if (hasArgument) {
+				back = argv[++arg];
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-m", 2)==0) {
-			modelname = argv[++arg];
+			if (hasArgument) {
+				modelname = argv[++arg];
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-w", 2)==0) {
-			sscanf(argv[++arg], "%d", &width);
+			if (hasArgument && sscanf(argv[++arg], "%d", &width)) {
+				if (!width) {
+					showUsage = true;
+				}
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-h", 2)==0) {
-			sscanf(argv[++arg], "%d", &height);
+			if (hasArgument && sscanf(argv[++arg], "%d", &height)) {
+				if (!height) {
+					showUsage = true;
+				}
+			} else {
+				showUsage = true;
+			}
 		} else if (strncmp(argv[arg], "-t", 2)==0) {
-			sscanf(argv[++arg], "%d", &threads);
+			if (hasArgument && sscanf(argv[++arg], "%d", &threads)) {
+				if (!threads) {
+					showUsage = true;
+				}
+			} else {
+				showUsage = true;
+			}
 		}
 	}
+
+	if (showUsage) {
+		fprintf(stderr, "\n");
+		fprintf(stderr, "usage:\n");
+		fprintf(stderr, "  deepseg [-?] [-d] [-c <capture>] [-v <virtual>] [-w <width>] [-h <height>]\n");
+		fprintf(stderr, "    [-t <threads>] [-b <background>] [-m <model>] [-g]\n");
+		fprintf(stderr, "\n");
+		fprintf(stderr, "-?            Display this usage information\n");
+		fprintf(stderr, "-d            Increase debug level\n");
+		fprintf(stderr, "-c            Specify the video source (capture) device\n");
+		fprintf(stderr, "-v            Specify the video target (sink) device\n");
+		fprintf(stderr, "-w            Specify the video stream width\n");
+		fprintf(stderr, "-h            Specify the video stream height\n");
+		fprintf(stderr, "-t            Specify the number of threads used for processing\n");
+		fprintf(stderr, "-b            Specify the background image\n");
+		fprintf(stderr, "-m            Specify the TFLite model used for segmentation\n");
+		fprintf(stderr, "-H            Mirror the output horizontally\n");
+		fprintf(stderr, "-V            Mirror the output vertically\n");
+		fprintf(stderr, "-g            Use dlib's hoG facial detector, ignores Tensorflow model\n");
+		exit(1);
+	}
+
 	printf("debug:  %d\n", debug);
 	printf("ccam:   %s\n", ccam);
 	printf("vcam:   %s\n", vcam);
 	printf("width:  %d\n", width);
 	printf("height: %d\n", height);
-	printf("back:   %s\n", back);
-	printf("threads:%d\n", threads);
-	printf("model:  %s\n", modelname);
+	printf("flip_h: %s\n", flipHorizontal ? "yes" : "no");
+	printf("flip_v: %s\n", flipVertical ? "yes" : "no");
 	printf("usehog: %d\n", usehog);
+	printf("threads:%d\n", threads);
+	printf("back:   %s\n", back ? back : "(none)");
+	printf("model:  %s\n\n", modelname);
 
 	// context data shared with callback
 	frame_ctx_t fctx;
@@ -190,21 +253,30 @@ int main(int argc, char* argv[]) {
 	TFLITE_MINIMAL_CHECK(fctx.pcap!=NULL);
 	printf("stream info: %dx%d @ %dfps\n", capw, caph, rate);
 
-	// check background file extension (yeah, I know) to spot videos..
+	// setup background image/video
 	fctx.pbkg = NULL;
-	int bkgw = width, bkgh = height;
-	char *dot = rindex((char*)back, '.');
-	if (dot!=NULL &&
-		(strcasecmp(dot, ".png")==0 ||
-		 strcasecmp(dot, ".jpg")==0 ||
-		 strcasecmp(dot, ".jpeg")==0)) {
-		// read background into raw BGR24 format, resize to output
-		fctx.bg = cv::imread(back);
-		cv::resize(fctx.bg,fctx.bg,cv::Size(width,height));
+	if (back && access(back, R_OK)==0) {
+		int bkgw = width, bkgh = height;
+		// check background file extension (yeah, I know) to spot videos..
+		char *dot = rindex((char*)back, '.');
+		if (dot!=NULL &&
+			(strcasecmp(dot, ".png")==0 ||
+			 strcasecmp(dot, ".jpg")==0 ||
+			 strcasecmp(dot, ".jpeg")==0)) {
+			// read background into raw BGR24 format, resize to output
+			fctx.bg = cv::imread(back);
+			cv::resize(fctx.bg,fctx.bg,cv::Size(width,height));
+		} else {
+			// assume video background..start capture
+			fctx.pbkg = capture_init(back, &bkgw, &bkgh, &rate, debug);
+			TFLITE_MINIMAL_CHECK(fctx.pbkg!=NULL);
+		}
 	} else {
-		// assume video background..start capture
-		fctx.pbkg = capture_init(back, &bkgw, &bkgh, &rate, debug);
-		TFLITE_MINIMAL_CHECK(fctx.pbkg!=NULL);
+		// default background to green screen
+		if (back) {
+			fprintf(stderr, "Warning: could not load background image, defaulting to green\n");
+		}
+		fctx.bg = cv::Mat(height,width,CV_8UC3,cv::Scalar(0,255,0));
 	}
 
 	// Are we flowing or hogging?
@@ -212,7 +284,7 @@ int main(int argc, char* argv[]) {
 	tfinfo_t *ptf = NULL;
 	cv::Mat input;
 	cv::Mat output;
-	float ratio = 1.0f;
+	cv::Rect roidim;
 	if (usehog) {
 		// Load HOG
 		phg = hog_init(debug);
@@ -227,15 +299,21 @@ int main(int argc, char* argv[]) {
 		tbuf = tf_get_buffer(ptf, TFINFO_BUF_OUT);
 		output = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
 		delete tbuf;
-		ratio = (float)input.rows/(float) input.cols;
-		printf("model rows=%d, cols=%d ratio=%f\n", input.rows, input.cols, ratio);
+		// https://stackoverflow.com/questions/13384594/fit-a-rectangle-into-another-rectangle
+		float imgRatio = (float)width/(float)height;
+		float modRatio = (float)output.cols/(float)output.rows;
+		float resize = (modRatio>imgRatio) ?
+			(float)width/(float)output.cols :
+			(float)height/(float)output.rows;
+		float roiWidth = (float)output.cols * resize;
+		float roiHeight = (float)output.rows * resize;
+		roidim = cv::Rect((int)(width-roiWidth)/2,(int)(height-roiHeight)/2,(int)roiWidth,(int)roiHeight);
+		printf("roidim(x,y,w,h)=(%d,%d,%d,%d)\n",roidim.x,roidim.y,roidim.width,roidim.height);
 	}
 
-	// initialize mask and square ROI in center
-	cv::Rect roidim = cv::Rect((width-height/ratio)/2,0,height/ratio,height);
+	// initialize mask and ROI in center (only used for TF but need to exist)
 	cv::Mat mask = cv::Mat::zeros(height,width,CV_32FC1);
 	cv::Mat mroi = mask(roidim);
-	printf("roidim(x,y,w,h)=(%d,%d,%d,%d)\n",roidim.x,roidim.y,roidim.width,roidim.height);
 	mask.copyTo(fctx.mask);
 
 	// erosion/dilation elements
@@ -314,7 +392,7 @@ int main(int argc, char* argv[]) {
 					// set mask to 1.0 where class == person
 					out[n] = (maxpos==pers ? 1.0 : 0);
 				}
-   			} else if (strstr(modelname,"body-pix")) {
+			} else if (strstr(modelname,"body-pix")) {
 				for (unsigned int n = 0; n < output.total(); n++) {
 					if (tmp[n] < 0.65) out[n] = 0; else out[n] = 1.0;
 				}
@@ -350,7 +428,6 @@ int main(int argc, char* argv[]) {
 				cv::blur(ofinal,ofinal,cv::Size(7,7));
 			// scale up into full-sized mask
 			cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
-
 		}
 		// update mask for render thread (under lock)
 		pthread_mutex_lock(&fctx.lock);
