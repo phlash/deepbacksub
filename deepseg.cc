@@ -51,10 +51,13 @@ typedef struct {
 	cv::Mat mask;
 	int lbfd;
 	int outw, outh;
+	int flip;
 	int debug;
 	bool done;
 	pthread_mutex_t lock;
 } frame_ctx_t;
+#define FLIP_VERT   0x01
+#define FLIP_HORZ   0x02
 
 // Process an incoming raw video frame
 bool process_frame(cv::Mat *cap, void *ctx) {
@@ -91,6 +94,12 @@ bool process_frame(cv::Mat *cap, void *ctx) {
 		++aptr;
 	}
 	pthread_mutex_unlock(&pfr->lock);
+
+	// flip either way?
+	if (pfr->flip & FLIP_HORZ)
+		cv::flip(out,out,1);
+	if (pfr->flip & FLIP_VERT)
+		cv::flip(out,out,0);
 
 	// write frame to v4l2loopback
 	cv::Mat yuv;
@@ -245,6 +254,7 @@ int main(int argc, char* argv[]) {
 	fctx.debug = debug;
 	fctx.outw = width;
 	fctx.outh = height;
+	fctx.flip = (flipHorizontal? FLIP_HORZ: 0) | (flipVertical? FLIP_VERT: 0);
 	// open loopback virtual camera stream, always with YUV420p output
 	fctx.lbfd = loopback_init(vcam,width,height,debug);
 	// open capture device stream, pass in/out expected/actual size
