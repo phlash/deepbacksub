@@ -8,6 +8,10 @@ TFLIBS=$(TFLITE)/gen/linux_x86_64/lib/
 CFLAGS += -I $(TFBASE) -I $(TFLITE)/downloads/absl -I $(TFLITE)/downloads/flatbuffers/include -ggdb
 LDFLAGS += -L $(TFLIBS) -ltensorflow-lite -ldl
 
+# minizip (used since OpenCV already has a dependency on it)
+CFLAGS += $(shell pkg-config --cflags minizip)
+LDFLAGS += $(shell pkg-config --libs minizip)
+
 # OpenCV
 ifeq ($(shell pkg-config --exists opencv; echo $$?), 0)
     CFLAGS += $(shell pkg-config --cflags opencv)

@@ -16,6 +16,7 @@ limitations under the License.
 #include <cstdio>
 #include <chrono>
 #include <string>
+#include <unzip.h>
 
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/register.h"
@@ -108,10 +109,10 @@ cv::Mat getTensorMat(int tnum, int debug) {
 }
 
 // deeplabv3 classes
-const std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
+static std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
 // label number of "person" for DeepLab v3+ model
-const size_t cnum = labels.size();
-const size_t pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
+static size_t cnum = labels.size();
+static size_t pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
 
 // timing helpers
 typedef std::chrono::high_resolution_clock::time_point timestamp_t;
@@ -190,6 +191,138 @@ void *grab_thread(void *arg) {
 	return NULL;
 }
 
+static std::vector<std::string> read_labels(const char *modelname) {
+	std::vector<std::string> res;
+	unzFile zip = unzOpen(modelname);
+	if (!zip)
+		goto done;
+	// TODO: check if anything other than this file name is used!
+	if (UNZ_OK!=unzLocateFile(zip, "labelmap.txt", 2))
+		goto done;
+	unz_file_info info;
+	if (UNZ_OK!=unzGetCurrentFileInfo(zip, &info, nullptr, 0, nullptr, 0, nullptr, 0))
+		goto done;
+	if (UNZ_OK!=unzOpenCurrentFile(zip))
+		goto done;
+	{
+		int len = (int)info.uncompressed_size;
+		char *buf = new char[len+1];
+		if (len!=unzReadCurrentFile(zip, buf, len)) {
+			delete buf;
+			goto done;
+		}
+		buf[len]=0;
+		std::istringstream str(buf);
+		std::string s;
+		while (std::getline(str, s))
+			res.push_back(s);
+		delete buf;
+		unzCloseCurrentFile(zip);
+	}
+done:
+	if (zip)
+		unzClose(zip);
+	return res;
+}
+
+static int parse_metadata(const uint8_t *buf, const uint32_t size, float *pmean, float *pstdd) {
+	// OK, let's hack through the flatbuffer format, to find out normalization values, schema here:
+	// https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs
+	// flatbuffers internals here: https://google.github.io/flatbuffers/md__internals.html
+	// and the file_identifier here: https://google.github.io/flatbuffers/md__schemas.html
+	// step#1, get to the root object (table ModelMetadata)
+	uint32_t root = *(uint32_t *)buf;
+	// step#2, get to the vtable
+	int32_t off = *(int32_t *)(buf+root);
+	uint32_t rvtb = root - off;		// yes, subtract a signed offset!
+	// step#2.1, if a file_identifier gap exists, check content
+	if (rvtb>=8) {
+		if (strncmp((const char *)(buf+4), "M001", 4))
+			return 1;
+	}
+	// step#3, read field offsets in root object for known fields..
+	off = rvtb + 4;                 // skip over rvts and root inline size
+	off += 4;						// move to 3rd field.
+	uint16_t overs = *(uint16_t *)(buf+off);
+	off += 2;
+	uint16_t osubg = *(uint16_t *)(buf+off);
+	// step#4, read version string, sanity check 'v1'
+	uint32_t vers = *(uint32_t *)(buf+root+overs) + (root+overs);
+	off = *(int32_t *)(buf+vers);
+	if (off!=2) return -1;
+	off = vers+4;
+	if (buf[off]!='v' || buf[off+1]!='1') return -2;
+	// step#5, navigate to subgraph vector
+	uint32_t subv = *(uint32_t *)(buf+root+osubg) + (root+osubg);
+	// step#6, ensure only one subgraph for TfLite
+	off = *(int32_t *)(buf+subv);
+	if (off!=1) return -3;
+	// step#7, get to the first subgraph object (table SubGraphMetadata), via vector offset
+	uint32_t sub1 = *(uint32_t *)(buf+subv+4) + (subv+4);
+	// step#8, get to the vtable
+	off = *(int32_t *)(buf+sub1);
+	uint32_t svtb = sub1 - off;
+	// step#9, read field offsets in subgraph vtable
+	off = svtb + 4;
+	off += 4;							// skip to 3rd field
+	uint16_t oitmd = *(uint16_t *)(buf+off);
+	// step#10, navigate to input tensor metadata vector
+	uint32_t itmdv = *(uint32_t *)(buf+sub1+oitmd) + (sub1+oitmd);
+	// step#11, ensure only one tensor metadata object
+	off = *(int32_t *)(buf+itmdv);
+	if (off!=1) return -4;
+	// step#12, get to the first tensor metadata object (table TensorMetadata) via vector offset
+	uint32_t itmd1 = *(uint32_t *)(buf+itmdv+4) + (itmdv+4);
+	// step#13, get to the vtable
+	off = *(int32_t *)(buf+itmd1);
+	uint32_t itvtb = itmd1 - off;
+	// step#14, read field offsets in tensor metadata vtable
+	off = itvtb + 4;
+	off += 8;							// skip to 5th field
+	uint16_t otmpus = *(uint16_t *)(buf+off);
+	// step#15, navigate to input tensor process unit vector
+	uint32_t itpuv = *(uint32_t *)(buf+itmd1+otmpus) + (itmd1+otmpus);
+	// step#16, ensure only one process unit object
+	off = *(int32_t *)(buf+itpuv);
+	if (off!=1) return -5;
+	// step#17, get to the first process unit object (table ProcessUnit) via vector offset
+	uint32_t itpu1 = *(uint32_t *)(buf+itpuv+4) + (itpuv+4);
+	// step#18, get to the vtable
+	off = *(int32_t *)(buf+itpu1);
+	uint32_t puvtb = itpu1 - off;
+	// step#19, read field offsets in option vtable
+	off = puvtb + 4;
+	uint16_t oopid = *(uint16_t *)(buf+off);
+	off += 2;
+	uint16_t oopvl = *(uint16_t *)(buf+off);
+	off += 2;
+	// step#20, ensure option id 1 is present (NormalizationOptions)
+	if (buf[itpu1+oopid]!=1) return -6;
+	// step#21, get to the normalization object (table NormalizationOptions) via offset
+	uint32_t norm = *(uint32_t *)(buf+itpu1+oopvl) + (itpu1+oopvl);
+	// step#22, get to the vtable
+	off = *(int32_t *)(buf+norm);
+	uint32_t novtb = norm - off;
+	// step#23, read field offsets in normalization options vtable
+	off = novtb + 4;
+	uint16_t onmean = *(uint16_t *)(buf+off);
+	off += 2;
+	uint16_t onstd = *(uint16_t *)(buf+off);
+	off += 2;
+	// step#24, navigate to the mean and std arrays
+	uint32_t nomeanv = *(uint32_t *)(buf+norm+onmean) + (norm+onmean);
+	uint32_t nostdv = *(uint32_t *)(buf+norm+onstd) + (norm+onstd);
+	// step#25, ensure one entry in each array
+	off = *(int32_t *)(buf+nomeanv);
+	if (off!=1) return -7;
+	off = *(int32_t *)(buf+nostdv);
+	if (off!=1) return -8;
+	// step#26, read the values (finally!)
+	*pmean = *(float *)(buf+nomeanv+4);
+	*pstdd = *(float *)(buf+nostdv+4);
+	return 0;
+}
+
 void init_tensorflow(calcinfo_t &info) {
 	// Load model
 	info.model = tflite::FlatBufferModel::BuildFromFile(info.modelname);
@@ -214,6 +347,40 @@ void init_tensorflow(calcinfo_t &info) {
 	info.input = getTensorMat(interpreter->inputs ()[0],info.debug);
 	info.output = getTensorMat(interpreter->outputs()[0],info.debug);
 	info.ratio = (float)info.input.cols/(float) info.input.rows;
+
+	// parse input normalization values from TFLITE_METADATA (if any)
+	auto model = info.model->GetModel();
+	auto *md = model->metadata();
+	// TODO: store output values in normalization structure..
+	float tmpmean = 0, tmpstdd = 0;
+	if (md) {
+		for (uint32_t mid=0; mid < md->size(); ++mid) {
+			const auto meta = md->Get(mid);
+			if (info.debug) printf("found: %s\n", meta->name()->c_str());
+			if (meta->name()->str() != "TFLITE_METADATA")
+				continue;
+			// grab raw buffer and parse it..
+			const flatbuffers::Vector<uint8_t> *pvec = model->buffers()->Get(meta->buffer())->data();
+			int rv = parse_metadata(pvec->data(), pvec->size(), &tmpmean, &tmpstdd);
+			if (rv)
+				printf("unable to parse TfLite metadata: %d\n", rv);
+		}
+	}
+	if (info.debug)
+		printf("normalization: mean:%f stdd:%f\n", tmpmean, tmpstdd);
+
+	// load model label names (if any)
+	std::vector<std::string> tmplabs = read_labels(info.modelname);
+	if (tmplabs.size() > 0) {
+		labels = tmplabs;
+		cnum = labels.size();
+		pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
+		if (info.debug) {
+			for (size_t l=0; l<labels.size(); ++l)
+				printf("output label: %s\n", labels[l].c_str());
+			printf("person@%ld\n", pers);
+		}
+	}
 
 	// initialize mask and square ROI in center
 	info.roidim = cv::Rect((info.width-info.height/info.ratio)/2,0,info.height/info.ratio,info.height);
@@ -321,14 +488,14 @@ int main(int argc, char* argv[]) {
 	size_t threads= 2;
 	size_t width  = 640;
 	size_t height = 480;
-	const char *back = nullptr; // "images/background.png";
-	const char *vcam = "/dev/video0";
-	const char *ccam = "/dev/video1";
+	const char *back = nullptr;
+	const char *vcam = "/dev/video1";
+	const char *ccam = "/dev/video0";
 	bool flipHorizontal = false;
 	bool flipVertical   = false;
 	int fourcc = 0;
 
-	const char* modelname = "models/segm_full_v679.tflite";
+	const char* modelname = "models/selfiesegmentation_mlkit-256x256-2021_01_19-v1215.f16.tflite";
 
 	bool showUsage = false;
 	for (int arg=1; arg<argc; arg++) {
