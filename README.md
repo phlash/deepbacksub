@@ -110,7 +110,7 @@ Tested with the following software:
 
 ## Building
 
-Install dependencies (`sudo apt install libopencv-dev build-essential v4l2loopback-dkms curl`).
+Install dependencies (`sudo apt install libopencv-dev build-essential v4l2loopback-dkms curl flatbuffers-compiler`).
 
 Clone this repository with `git clone --recursive https://github.com/floe/backscrub.git`.
 To speed up the checkout you can additionally pass `--depth=1` to `git clone`.

@@ -23,7 +23,7 @@ else
     $(error Couldn\'t find OpenCV)
 endif
 
-deepseg: $(TFLIBS)/libtensorflow-lite.a deepseg.cc loopback.cc transpose_conv_bias.cc
+deepseg: $(TFLIBS)/libtensorflow-lite.a deepseg.cc loopback.cc transpose_conv_bias.cc metadata_schema_generated.h
 	g++ $^ ${CFLAGS} ${LDFLAGS} -o $@
 
 $(TFLIBS)/libtensorflow-lite.a: $(TFLITE)
@@ -31,6 +31,9 @@ $(TFLIBS)/libtensorflow-lite.a: $(TFLITE)
 
 $(TFLITE):
 	git submodule update --init --recursive
+
+metadata_schema_generated.h: metadata_schema.fbs
+	flatc --scoped-enums -c $^
 
 all: deepseg
 

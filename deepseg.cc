@@ -31,6 +31,7 @@ limitations under the License.
 
 #include "loopback.h"
 #include "transpose_conv_bias.h"
+#include "metadata_schema_generated.h"
 
 int fourCcFromString(const std::string& in)
 {
@@ -191,13 +192,12 @@ void *grab_thread(void *arg) {
 	return NULL;
 }
 
-static std::vector<std::string> read_labels(const char *modelname) {
+static std::vector<std::string> read_labels(const char *modelname, const char *labelfile) {
 	std::vector<std::string> res;
 	unzFile zip = unzOpen(modelname);
 	if (!zip)
 		goto done;
-	// TODO: check if anything other than this file name is used!
-	if (UNZ_OK!=unzLocateFile(zip, "labelmap.txt", 2))
+	if (UNZ_OK!=unzLocateFile(zip, labelfile, 2))
 		goto done;
 	unz_file_info info;
 	if (UNZ_OK!=unzGetCurrentFileInfo(zip, &info, nullptr, 0, nullptr, 0, nullptr, 0))
@@ -225,101 +225,36 @@ done:
 	return res;
 }
 
-static int parse_metadata(const uint8_t *buf, const uint32_t size, float *pmean, float *pstdd) {
-	// OK, let's hack through the flatbuffer format, to find out normalization values, schema here:
-	// https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs
-	// flatbuffers internals here: https://google.github.io/flatbuffers/md__internals.html
-	// and the file_identifier here: https://google.github.io/flatbuffers/md__schemas.html
-	// step#1, get to the root object (table ModelMetadata)
-	uint32_t root = *(uint32_t *)buf;
-	// step#2, get to the vtable
-	int32_t off = *(int32_t *)(buf+root);
-	uint32_t rvtb = root - off;		// yes, subtract a signed offset!
-	// step#2.1, if a file_identifier gap exists, check content
-	if (rvtb>=8) {
-		if (strncmp((const char *)(buf+4), "M001", 4))
-			return 1;
+static int parse_metadata(const uint8_t *buf, const uint32_t size, float *pmean, float *pstdd, std::string *plabels) {
+	// check we have the right buffer
+	if (!ModelMetadataBufferHasIdentifier(buf))
+		return 1;
+	const ModelMetadata *md = GetModelMetadata(buf);
+	if (md->version()->str() != "v1")
+		return -1;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::SubGraphMetadata>> *subg = md->subgraph_metadata();
+	if (subg->size()!=1)
+		return -3;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::TensorMetadata>> *itmd = subg->Get(0)->input_tensor_metadata();
+	if (itmd->size()!=1)
+		return -4;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::ProcessUnit>> *pus = itmd->Get(0)->process_units();
+	if (pus->size()!=1)
+		return -5;
+	const tflite::ProcessUnit *pu = pus->Get(0);
+	if (pu->options_type()!=tflite::ProcessUnitOptions::NormalizationOptions)
+		return -6;
+	const tflite::NormalizationOptions *norm = pu->options_as_NormalizationOptions();
+	if (norm->mean()->size()!=1)
+		return -7;
+	if (norm->std()->size()!=1)
+		return -8;
+	*pmean = norm->mean()->Get(0);
+	*pstdd = norm->std()->Get(0);
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::TensorMetadata>> *otmd = subg->Get(0)->output_tensor_metadata();
+	if (otmd && otmd->size()==1) {
+		*plabels = otmd->Get(0)->associated_files()->Get(0)->name()->str();
 	}
-	// step#3, read field offsets in root object for known fields..
-	off = rvtb + 4;                 // skip over rvts and root inline size
-	off += 4;						// move to 3rd field.
-	uint16_t overs = *(uint16_t *)(buf+off);
-	off += 2;
-	uint16_t osubg = *(uint16_t *)(buf+off);
-	// step#4, read version string, sanity check 'v1'
-	uint32_t vers = *(uint32_t *)(buf+root+overs) + (root+overs);
-	off = *(int32_t *)(buf+vers);
-	if (off!=2) return -1;
-	off = vers+4;
-	if (buf[off]!='v' || buf[off+1]!='1') return -2;
-	// step#5, navigate to subgraph vector
-	uint32_t subv = *(uint32_t *)(buf+root+osubg) + (root+osubg);
-	// step#6, ensure only one subgraph for TfLite
-	off = *(int32_t *)(buf+subv);
-	if (off!=1) return -3;
-	// step#7, get to the first subgraph object (table SubGraphMetadata), via vector offset
-	uint32_t sub1 = *(uint32_t *)(buf+subv+4) + (subv+4);
-	// step#8, get to the vtable
-	off = *(int32_t *)(buf+sub1);
-	uint32_t svtb = sub1 - off;
-	// step#9, read field offsets in subgraph vtable
-	off = svtb + 4;
-	off += 4;							// skip to 3rd field
-	uint16_t oitmd = *(uint16_t *)(buf+off);
-	// step#10, navigate to input tensor metadata vector
-	uint32_t itmdv = *(uint32_t *)(buf+sub1+oitmd) + (sub1+oitmd);
-	// step#11, ensure only one tensor metadata object
-	off = *(int32_t *)(buf+itmdv);
-	if (off!=1) return -4;
-	// step#12, get to the first tensor metadata object (table TensorMetadata) via vector offset
-	uint32_t itmd1 = *(uint32_t *)(buf+itmdv+4) + (itmdv+4);
-	// step#13, get to the vtable
-	off = *(int32_t *)(buf+itmd1);
-	uint32_t itvtb = itmd1 - off;
-	// step#14, read field offsets in tensor metadata vtable
-	off = itvtb + 4;
-	off += 8;							// skip to 5th field
-	uint16_t otmpus = *(uint16_t *)(buf+off);
-	// step#15, navigate to input tensor process unit vector
-	uint32_t itpuv = *(uint32_t *)(buf+itmd1+otmpus) + (itmd1+otmpus);
-	// step#16, ensure only one process unit object
-	off = *(int32_t *)(buf+itpuv);
-	if (off!=1) return -5;
-	// step#17, get to the first process unit object (table ProcessUnit) via vector offset
-	uint32_t itpu1 = *(uint32_t *)(buf+itpuv+4) + (itpuv+4);
-	// step#18, get to the vtable
-	off = *(int32_t *)(buf+itpu1);
-	uint32_t puvtb = itpu1 - off;
-	// step#19, read field offsets in option vtable
-	off = puvtb + 4;
-	uint16_t oopid = *(uint16_t *)(buf+off);
-	off += 2;
-	uint16_t oopvl = *(uint16_t *)(buf+off);
-	off += 2;
-	// step#20, ensure option id 1 is present (NormalizationOptions)
-	if (buf[itpu1+oopid]!=1) return -6;
-	// step#21, get to the normalization object (table NormalizationOptions) via offset
-	uint32_t norm = *(uint32_t *)(buf+itpu1+oopvl) + (itpu1+oopvl);
-	// step#22, get to the vtable
-	off = *(int32_t *)(buf+norm);
-	uint32_t novtb = norm - off;
-	// step#23, read field offsets in normalization options vtable
-	off = novtb + 4;
-	uint16_t onmean = *(uint16_t *)(buf+off);
-	off += 2;
-	uint16_t onstd = *(uint16_t *)(buf+off);
-	off += 2;
-	// step#24, navigate to the mean and std arrays
-	uint32_t nomeanv = *(uint32_t *)(buf+norm+onmean) + (norm+onmean);
-	uint32_t nostdv = *(uint32_t *)(buf+norm+onstd) + (norm+onstd);
-	// step#25, ensure one entry in each array
-	off = *(int32_t *)(buf+nomeanv);
-	if (off!=1) return -7;
-	off = *(int32_t *)(buf+nostdv);
-	if (off!=1) return -8;
-	// step#26, read the values (finally!)
-	*pmean = *(float *)(buf+nomeanv+4);
-	*pstdd = *(float *)(buf+nostdv+4);
 	return 0;
 }
 
@@ -353,6 +288,8 @@ void init_tensorflow(calcinfo_t &info) {
 	auto *md = model->metadata();
 	// TODO: store output values in normalization structure..
 	float tmpmean = 0, tmpstdd = 0;
+	// default labels files name
+	std::string labfile = "labelmap.txt";
 	if (md) {
 		for (uint32_t mid=0; mid < md->size(); ++mid) {
 			const auto meta = md->Get(mid);
@@ -361,24 +298,24 @@ void init_tensorflow(calcinfo_t &info) {
 				continue;
 			// grab raw buffer and parse it..
 			const flatbuffers::Vector<uint8_t> *pvec = model->buffers()->Get(meta->buffer())->data();
-			int rv = parse_metadata(pvec->data(), pvec->size(), &tmpmean, &tmpstdd);
+			int rv = parse_metadata(pvec->data(), pvec->size(), &tmpmean, &tmpstdd, &labfile);
 			if (rv)
 				printf("unable to parse TfLite metadata: %d\n", rv);
 		}
 	}
 	if (info.debug)
-		printf("normalization: mean:%f stdd:%f\n", tmpmean, tmpstdd);
+		printf("normalization: mean:%f stdd:%f\nlabels: %s\n", tmpmean, tmpstdd, labfile.c_str());
 
 	// load model label names (if any)
-	std::vector<std::string> tmplabs = read_labels(info.modelname);
+	std::vector<std::string> tmplabs = read_labels(info.modelname, labfile.c_str());
 	if (tmplabs.size() > 0) {
 		labels = tmplabs;
 		cnum = labels.size();
 		pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
 		if (info.debug) {
 			for (size_t l=0; l<labels.size(); ++l)
-				printf("output label: %s\n", labels[l].c_str());
-			printf("person@%ld\n", pers);
+				printf("\tlabel(%lu): %s\n", l, labels[l].c_str());
+			printf("\tperson@%ld\n", pers);
 		}
 	}
 
