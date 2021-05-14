@@ -38,7 +38,7 @@ metadata_schema_generated.h: metadata_schema.fbs
 all: deepseg
 
 clean:
-	-rm deepseg
+	-rm deepseg metadata_schema_generated.h
 
 tv: transparent_viewer.c
 	g++ -o $@ $^ -lX11 -lGL $(CFLAGS) $(LDFLAGS)

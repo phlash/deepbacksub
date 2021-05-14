@@ -32,5 +32,6 @@
 *.app
 
 deepseg
+metadata_schema_generated.h
 models/body-pix/bodypix_*
 tv
